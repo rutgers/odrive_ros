@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 from __future__ import print_function
 
 #import roslib; roslib.load_manifest('BINCADDY')
@@ -21,12 +21,11 @@ import diagnostic_updater, diagnostic_msgs.msg
 import time
 import math
 import traceback
-import Queue
+import queue
 
-from odrive_interface import ODriveInterfaceAPI, ODriveFailure
-from odrive_interface import ChannelBrokenException, ChannelDamagedException
-from odrive_simulator import ODriveInterfaceSimulator
-
+from odrive_ros.odrive_interface import ODriveInterfaceAPI, ODriveFailure
+from fibre.protocol import ObjectLostError, ChannelDamagedException
+from odrive_ros.odrive_simulator import ODriveInterfaceSimulator
 class ROSLogger(object):
     """Imitate a standard Python logger, but pass the messages to rospy logging.
     """
@@ -82,28 +81,30 @@ class ODriveNode(object):
     sim_mode = False
     
     def __init__(self):
+        self.calibrated = False
         self.sim_mode             = get_param('simulation_mode', False)
         self.publish_joint_angles = get_param('publish_joint_angles', True) # if self.sim_mode else False
         self.publish_temperatures = get_param('publish_temperatures', True)
         
-        self.axis_for_right = float(get_param('~axis_for_right', 0)) # if right calibrates first, this should be 0, else 1
+        self.axis_for_right  = float(get_param('~axis_for_right', 0)) # if right calibrates first, this should be 0, else 1
         self.wheel_track = float(get_param('~wheel_track', 0.285)) # m, distance between wheel centres
         self.tyre_circumference = float(get_param('~tyre_circumference', 0.341)) # used to translate velocity commands in m/s into motor rpm
-        
+        self.gear_ratio = float(get_param('~gear_ratio', 1)) # used to translate velocity commands in m/s into motor rpm
+
         self.connect_on_startup   = get_param('~connect_on_startup', False)
-        #self.calibrate_on_startup = get_param('~calibrate_on_startup', False)
+        self.calibrate_on_startup = get_param('~calibrate_on_startup', False)
         #self.engage_on_startup    = get_param('~engage_on_startup', False)
         
-        self.has_preroll     = get_param('~use_preroll', True)
+        self.has_preroll     = get_param('~use_preroll', False)
                 
         self.publish_current = get_param('~publish_current', True)
         self.publish_raw_odom =get_param('~publish_raw_odom', True)
         
         self.publish_odom    = get_param('~publish_odom', True)
         self.publish_tf      = get_param('~publish_odom_tf', False)
-        self.odom_topic      = get_param('~odom_topic', "odom")
+        self.odom_topic      = get_param('~odom_topic', "/odom")
         self.odom_frame      = get_param('~odom_frame', "odom")
-        self.base_frame      = get_param('~base_frame', "base_link")
+        self.base_frame      = get_param('~base_frame', "base_footprint")
         self.odom_calc_hz    = get_param('~odom_calc_hz', 10)
         
         rospy.on_shutdown(self.terminate)
@@ -123,7 +124,7 @@ class ODriveNode(object):
         self.status = "disconnected"
         self.status_pub.publish(self.status)
         
-        self.command_queue = Queue.Queue(maxsize=5)
+        self.command_queue = queue.Queue(maxsize=5)
         self.vel_subscribe = rospy.Subscriber("/cmd_vel", Twist, self.cmd_vel_callback, queue_size=2)
         
         self.publish_diagnostics = True
@@ -229,6 +230,15 @@ class ODriveNode(object):
             except rospy.ROSInterruptException: # shutdown / stop ODrive??
                 break;
             
+            if not self.calibrated and self.driver and self.calibrate_on_startup:
+                rospy.loginfo("Starting Calibration")
+                if self.calibrate_motor(None)[0]:
+                    #self.driver.original_pos_l = self.driver.left_axis.encoder.pos_estimate
+                    #self.driver.original_pos_r = self.driver.right_axis.encoder.pos_estimate
+                    self.calibrated = True
+                    #self.driver.calibrated = True
+                else:
+                    rospy.logerr("Failed to Calibrate")
             # fast timer running, so do nothing and wait for any errors
             if self.fast_timer_comms_active:
                 continue
@@ -249,7 +259,7 @@ class ODriveNode(object):
                     else:
                         # must have called connect service from another node
                         self.fast_timer_comms_active = True
-                except (ChannelBrokenException, ChannelDamagedException, AttributeError):
+                except (ObjectLostError, ChannelDamagedException, AttributeError):
                     rospy.logerr("ODrive USB connection failure in main_loop.")
                     self.status = "disconnected"
                     self.status_pub.publish(self.status)
@@ -259,7 +269,7 @@ class ODriveNode(object):
                     self.status = "disconnected"
                     self.status_pub.publish(self.status)
                     self.driver = None
-            
+                           
             if not self.driver:
                 if not self.connect_on_startup:
                     #rospy.loginfo("ODrive node started, but not connected.")
@@ -311,7 +321,7 @@ class ODriveNode(object):
                     self.driver.update_time(time_now.to_sec())
                     self.vel_l = self.driver.left_vel_estimate()   # units: encoder counts/s
                     self.vel_r = -self.driver.right_vel_estimate() # neg is forward for right
-                    self.new_pos_l = self.driver.left_pos()        # units: encoder counts
+                    self.new_pos_l = self.driver.left_pos()      # units: encoder counts
                     self.new_pos_r = -self.driver.right_pos()      # sign!
                     
                     # for temperatures
@@ -323,7 +333,7 @@ class ODriveNode(object):
                     # voltage
                     self.bus_voltage = self.driver.bus_voltage()
                     
-            except (ChannelBrokenException, ChannelDamagedException):
+            except (ObjectLostError, ChannelDamagedException):
                 rospy.logerr("ODrive USB connection failure in fast_timer." + traceback.format_exc(1))
                 self.fast_timer_comms_active = False
                 self.status = "disconnected"
@@ -357,7 +367,7 @@ class ODriveNode(object):
                 # release motor after 10s stopped
                 if (time_now - self.last_cmd_vel_time).to_sec() > 10.0 and self.driver.engaged():
                     self.driver.release() # and release            
-        except (ChannelBrokenException, ChannelDamagedException):
+        except (ObjectLostError, ChannelDamagedException):
             rospy.logerr("ODrive USB connection failure in cmd_vel timeout." + traceback.format_exc(1))
             self.fast_timer_comms_active = False
             self.driver = None
@@ -371,7 +381,7 @@ class ODriveNode(object):
         if self.fast_timer_comms_active and not self.command_queue.empty():
             # check to see if we're initialised and engaged motor
             try:
-                if not self.driver.has_prerolled(): #ensure_prerolled():
+                if not self.calibrated and not self.driver.has_prerolled(): #ensure_prerolled():
                     rospy.logwarn_throttle(5.0, "ODrive has not been prerolled, ignoring drive command.")
                     motor_command = self.command_queue.get_nowait()
                     return
@@ -380,7 +390,7 @@ class ODriveNode(object):
                 self.fast_timer_comms_active = False                
             try:
                 motor_command = self.command_queue.get_nowait()
-            except Queue.Empty:
+            except queue.Empty:
                 rospy.logerr("Queue was empty??" + traceback.format_exc())
                 return
             
@@ -388,6 +398,7 @@ class ODriveNode(object):
                 try:
                     if self.publish_current and self.i2t_error_latch:
                         # have exceeded i2t bounds
+                        rospy.logerr("Surpassed i2t bounds")
                         return
                     
                     if not self.driver.engaged():
@@ -398,7 +409,7 @@ class ODriveNode(object):
                     self.driver.drive(left_linear_val, right_linear_val)
                     self.last_speed = max(abs(left_linear_val), abs(right_linear_val))
                     self.last_cmd_vel_time = time_now
-                except (ChannelBrokenException, ChannelDamagedException):
+                except (ObjectLostError, ChannelDamagedException):
                     rospy.logerr("ODrive USB connection failure in drive_cmd." + traceback.format_exc(1))
                     self.fast_timer_comms_active = False
                     self.driver = None
@@ -435,11 +446,13 @@ class ODriveNode(object):
         #rospy.loginfo("ODrive connected.")
         
         # okay, connected, 
+        
+
         self.m_s_to_value = self.driver.encoder_cpr/self.tyre_circumference
         
         if self.publish_odom:
-            self.old_pos_l = self.driver.left_axis.encoder.pos_cpr
-            self.old_pos_r = self.driver.right_axis.encoder.pos_cpr
+            self.old_pos_l = self.driver.left_axis.encoder.pos_estimate
+            self.old_pos_r = self.driver.right_axis.encoder.pos_estimate
         
         self.fast_timer_comms_active = True
         
@@ -466,8 +479,10 @@ class ODriveNode(object):
         if not self.driver:
             rospy.logerr("Not connected.")
             return (False, "Not connected.")
-            
-        if self.has_preroll:
+
+        
+
+        if False and self.has_preroll:
             self.odometry_update_enabled = False # disable odometry updates while we preroll
             if not self.driver.preroll(wait=True):
                 self.status = "preroll_fail"
@@ -480,9 +495,10 @@ class ODriveNode(object):
         else:
             if not self.driver.calibrate():
                 return (False, "Failed calibration.")
-                
-        return (True, "Calibration success.")
-    
+
+
+            return (True, "Calibration Successful")
+
     def engage_motor(self, request):
         if not self.driver:
             rospy.logerr("Not connected.")
@@ -507,7 +523,7 @@ class ODriveNode(object):
         if enable:
             self.odometry_update_enabled = True
             return(True, "Odometry enabled.")
-        else:
+        else:   
             self.odometry_update_enabled = False
             return(True, "Odometry disabled.")
     
@@ -522,8 +538,10 @@ class ODriveNode(object):
     
     def convert(self, forward, ccw):
         angular_to_linear = ccw * (self.wheel_track/2.0) 
-        left_linear_val  = int((forward - angular_to_linear) * self.m_s_to_value)
-        right_linear_val = int((forward + angular_to_linear) * self.m_s_to_value)
+        left_linear_val  = -((forward - angular_to_linear)) / self.tyre_circumference / self.gear_ratio
+        right_linear_val = -((forward + angular_to_linear)) / self.tyre_circumference / self.gear_ratio
+        # left_linear_val  = int((forward - angular_to_linear) * self.m_s_to_value)
+        # right_linear_val = int((forward + angular_to_linear) * self.m_s_to_value)
     
         return left_linear_val, right_linear_val
 
@@ -556,7 +574,7 @@ class ODriveNode(object):
         try:
             drive_command = ('drive', (left_linear_val, right_linear_val))
             self.command_queue.put_nowait(drive_command)
-        except Queue.Full:
+        except queue.Full:
             pass
             
         self.last_cmd_vel_time = rospy.Time.now()
@@ -622,7 +640,7 @@ class ODriveNode(object):
         self.current_publisher_left.publish(float(self.current_l))
         self.current_publisher_right.publish(float(self.current_r))
         
-        now = time.time()
+        now = rospy.Time.now()
         
         if not hasattr(self, 'last_pub_current_time'):
             self.last_pub_current_time = now
@@ -631,7 +649,7 @@ class ODriveNode(object):
             return
             
         # calculate and publish i2t
-        dt = now - self.last_pub_current_time
+        dt = now.to_sec() - self.last_pub_current_time.to_sec()
         
         power = max(0, self.current_l**2 - self.i2t_current_nominal**2)
         energy = power * dt
@@ -703,8 +721,8 @@ class ODriveNode(object):
             return
         
         # Twist/velocity: calculated from motor values only
-        s = tyre_circumference * (self.vel_l+self.vel_r) / (2.0*self.encoder_cpr)
-        w = tyre_circumference * (self.vel_r-self.vel_l) / (wheel_track * self.encoder_cpr) # angle: vel_r*tyre_radius - vel_l*tyre_radius
+        s = tyre_circumference * self.gear_ratio * (self.vel_l+self.vel_r) / (2.0)
+        w = tyre_circumference * self.gear_ratio * (self.vel_r-self.vel_l) / (wheel_track) # angle: vel_r*tyre_radius - vel_l*tyre_radius
         self.odom_msg.twist.twist.linear.x = s
         self.odom_msg.twist.twist.angular.z = w
     
@@ -720,20 +738,20 @@ class ODriveNode(object):
         self.old_pos_l = self.new_pos_l
         self.old_pos_r = self.new_pos_r
         
-        # Check for overflow. Assume we can't move more than half a circumference in a single timestep. 
-        half_cpr = self.encoder_cpr/2.0
-        if   delta_pos_l >  half_cpr: delta_pos_l = delta_pos_l - self.encoder_cpr
-        elif delta_pos_l < -half_cpr: delta_pos_l = delta_pos_l + self.encoder_cpr
-        if   delta_pos_r >  half_cpr: delta_pos_r = delta_pos_r - self.encoder_cpr
-        elif delta_pos_r < -half_cpr: delta_pos_r = delta_pos_r + self.encoder_cpr
+        # # Check for overflow. Assume we can't move more than half a circumference in a single timestep. 
+        # half_cpr = self.encoder_cpr/2.0
+        # if   delta_pos_l >  half_cpr: delta_pos_l = delta_pos_l - self.encoder_cpr
+        # elif delta_pos_l < -half_cpr: delta_pos_l = delta_pos_l + self.encoder_cpr
+        # if   delta_pos_r >  half_cpr: delta_pos_r = delta_pos_r - self.encoder_cpr
+        # elif delta_pos_r < -half_cpr: delta_pos_r = delta_pos_r + self.encoder_cpr
         
         # counts to metres
-        delta_pos_l_m = delta_pos_l / self.m_s_to_value
-        delta_pos_r_m = delta_pos_r / self.m_s_to_value
+        delta_pos_l_m = delta_pos_l * self.gear_ratio * self.tyre_circumference
+        delta_pos_r_m = delta_pos_r * self.gear_ratio * self.tyre_circumference
     
         # Distance travelled
-        d = (delta_pos_l_m+delta_pos_r_m)/2.0  # delta_ps
-        th = (delta_pos_r_m-delta_pos_l_m)/wheel_track # works for small angles
+        d = -(delta_pos_l_m+delta_pos_r_m)/2.0  # delta_ps
+        th = -(delta_pos_r_m-delta_pos_l_m)/wheel_track # works for small angles
     
         xd = math.cos(th)*d
         yd = -math.sin(th)*d
